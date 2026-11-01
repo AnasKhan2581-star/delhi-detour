@@ -81,6 +81,12 @@ button,input,select{font:inherit;color:inherit}
 .toggles{display:flex;gap:4px 14px;flex-wrap:wrap;margin-top:8px;padding:0 2px;font-size:13px;color:var(--muted)}
 .toggles label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
 .toggles input{accent-color:var(--accent);width:16px;height:16px}
+.linkbtn{border:0;background:none;padding:0;color:var(--accent);font-weight:700;font-size:13px;cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+#g-panel{margin-top:8px;padding:10px;border-radius:10px;background:var(--surface-2);font-size:13px;display:flex;flex-direction:column;gap:8px}
+#g-panel small{color:var(--muted);line-height:1.45}
+#g-panel code{font-size:12px;word-break:break-all}
+.g-row{display:flex;gap:6px}
+.g-row input{flex:1;min-width:0;height:40px;border:1px solid var(--line);border-radius:10px;padding:0 10px;background:var(--surface)}
 #banner{margin-top:8px;padding:8px 12px;font-size:13px;border-radius:10px;background:color-mix(in srgb,var(--closed) 14%,var(--surface));border:1px solid color-mix(in srgb,var(--closed) 35%,transparent)}
 #collapse{display:none}
 
@@ -204,6 +210,12 @@ ol.dirs .d{font-size:12.5px;color:var(--muted);white-space:nowrap;font-variant-n
       <div class="toggles">
         <label for="t-congest"><input type="checkbox" id="t-congest">Also avoid congested roads</label>
         <label for="t-allday"><input type="checkbox" id="t-allday">Ignore police timings</label>
+        <button class="linkbtn" id="g-open" aria-expanded="false">Google search: Off</button>
+      </div>
+      <div id="g-panel" hidden>
+        <label for="g-key">Google Maps Platform API key (Places API (New) enabled). Stored only in this browser.</label>
+        <div class="g-row"><input id="g-key" type="password" placeholder="AIza…" autocomplete="off" spellcheck="false"><button class="btn primary" id="g-save">Save</button><button class="btn" id="g-del">Remove</button></div>
+        <small>Gives the same places as Google Maps. Get a key at console.cloud.google.com → APIs &amp; Services → enable "Places API (New)" → Credentials. Restrict it to <code>anaskhan2581-star.github.io/*</code>. Autocomplete is free up to Google's monthly cap.</small>
       </div>
       <div id="banner" hidden></div>
     </div>
@@ -453,23 +465,83 @@ function placeLabel(pr){
   const sub=[pr.street&&pr.name?pr.street:null,pr.district||pr.locality,pr.city||pr.county,pr.state].filter(Boolean).filter((v,i,a)=>a.indexOf(v)===i&&v!==main).join(", ");
   return {main,sub};
 }
+/* ---- direct input: coordinates, Google Maps URLs, plus codes ---- */
+const OLC="23456789CFGHJMPQRVWX";
+function olcDecode(code){ // full code → [lat,lon] centre
+  code=code.toUpperCase().replace("+","").replace(/0+$/,"");
+  let lat=-90,lon=-180,res=20;
+  for(let i=0;i<Math.min(code.length,10);i+=2){lat+=OLC.indexOf(code[i])*res;lon+=OLC.indexOf(code[i+1]||"2")*res;if(i<8)res/=20}
+  let la=res,lo=res; if(code.length<=10) return [lat+la/2,lon+lo/2];
+  for(let i=10;i<code.length;i++){la/=5;lo/=4;const d=OLC.indexOf(code[i]);lat+=Math.floor(d/4)*la;lon+=(d%4)*lo}
+  return [lat+la/2,lon+lo/2];
+}
+function olcPrefix(lat,lon,n){ let a=lat+90,b=lon+180,res=20,s="";
+  for(let i=0;i<n;i+=2){const x=Math.floor(a/res),y=Math.floor(b/res);s+=OLC[x]+OLC[y];a-=x*res;b-=y*res;res/=20} return s; }
+function parseDirect(q){
+  let m=q.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/)||q.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/)||q.match(/[?&](?:q|query|destination|ll|daddr|saddr)=(-?\d+\.\d+)(?:,|%2C)\s*(-?\d+\.\d+)/i)
+        ||q.match(/^\s*(-?\d{1,2}\.\d{3,})\s*[,\s]\s*(-?\d{2,3}\.\d{3,})\s*$/);
+  if(m){const a=+m[1],b=+m[2];if(Math.abs(a)<=90&&Math.abs(b)<=180)return {lat:a,lon:b,label:`${a.toFixed(5)}, ${b.toFixed(5)}`,kind:"Coordinates"}}
+  const full=q.toUpperCase().match(/\b([23456789CFGHJMPQRVWX]{8}\+[23456789CFGHJMPQRVWX]{2,3})\b/);
+  if(full){const [a,b]=olcDecode(full[1]);return {lat:a,lon:b,label:full[1],kind:"Plus code"}}
+  const short=q.toUpperCase().match(/\b([23456789CFGHJMPQRVWX]{4}\+[23456789CFGHJMPQRVWX]{2,3})\b/);
+  if(short){const c=map.getCenter();let [a,b]=olcDecode(olcPrefix(c.lat,c.lng,4)+short[1]);
+    if(a-c.lat>.5)a-=1;else if(c.lat-a>.5)a+=1; if(b-c.lng>.5)b-=1;else if(c.lng-b>.5)b+=1;
+    return {lat:a,lon:b,label:short[1],kind:"Plus code"}}
+  return null;
+}
+/* ---- providers ---- */
+const gKey=()=>store.get("dd-gkey")||"";
+let gSession=null;
+async function searchGoogle(q,signal){
+  const k=gKey(); if(!k) return [];
+  gSession=gSession||(crypto.randomUUID?crypto.randomUUID():String(Math.random()).slice(2));
+  const c=map.getCenter();
+  const r=await fetch("https://places.googleapis.com/v1/places:autocomplete",{method:"POST",signal,headers:{"Content-Type":"application/json","X-Goog-Api-Key":k},
+    body:JSON.stringify({input:q,sessionToken:gSession,includedRegionCodes:["in"],locationBias:{circle:{center:{latitude:c.lat,longitude:c.lng},radius:50000}}})});
+  const j=await r.json(); if(!r.ok) throw Object.assign(new Error((j.error&&j.error.message)||"Google search failed"),{google:true});
+  return (j.suggestions||[]).filter(s=>s.placePrediction).map(s=>{const p=s.placePrediction;return {src:"Google",main:p.structuredFormat?p.structuredFormat.mainText.text:p.text.text,sub:p.structuredFormat&&p.structuredFormat.secondaryText?p.structuredFormat.secondaryText.text:"",placeId:p.placeId}});
+}
+async function googleDetails(id){
+  const r=await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(id)}?sessionToken=${gSession||""}`,{headers:{"X-Goog-Api-Key":gKey(),"X-Goog-FieldMask":"location,displayName"}});
+  gSession=null; const j=await r.json(); if(!r.ok||!j.location) throw new Error((j.error&&j.error.message)||"No location");
+  return {lat:j.location.latitude,lon:j.location.longitude};
+}
+async function searchPhoton(q,signal){
+  const c=map.getCenter();
+  const r=await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&lat=${c.lat.toFixed(4)}&lon=${c.lng.toFixed(4)}&limit=8&bbox=76.84,28.40,77.55,28.89`,{signal});
+  const j=await r.json(); return j.features.map(f=>({src:"OSM",...placeLabel(f.properties),lat:f.geometry.coordinates[1],lon:f.geometry.coordinates[0]}));
+}
+async function searchNominatim(q,signal){
+  const r=await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=jsonv2&countrycodes=in&viewbox=76.84,28.89,77.55,28.40&bounded=1&limit=8`,{signal,headers:{"Accept-Language":"en"}});
+  const j=await r.json(); return j.map(x=>{const parts=x.display_name.split(", ");return {src:"OSM",main:x.name||parts[0],sub:parts.slice(1,4).join(", "),lat:+x.lat,lon:+x.lon}});
+}
+function mergeOSM(a,b){ const out=[...a];
+  for(const x of b){ if(!out.some(y=>y.main.toLowerCase()===x.main.toLowerCase()&&Math.abs(y.lat-x.lat)<.002&&Math.abs(y.lon-x.lon)<.002)) out.push(x); }
+  return out.slice(0,9); }
+
 function wireSearch(which){
   const inp=$("#"+which), box=$("#sugg-"+which); let timer, ctrl;
+  const row=(html,fn)=>{const b=document.createElement("button");b.innerHTML=html;if(fn)b.onclick=fn;else b.disabled=true;box.appendChild(b);return b};
+  const pick=p=>{box.hidden=true;inp.blur();setPoint(which,p,p.label==="Dropped pin")};
   inp.addEventListener("input",()=>{
     clearTimeout(timer); const q=inp.value.trim(); if(q.length<2){box.hidden=true;return}
+    const d=parseDirect(q);
+    if(d){box.innerHTML="";row(`<b>${esc(d.label)}</b><small>${d.kind} · tap to use</small>`,()=>{box.hidden=true;inp.blur();setPoint(which,{lat:d.lat,lon:d.lon,label:d.label},true)});box.hidden=false;return}
+    if(/goo\.gl|maps\.app/i.test(q)){box.innerHTML="";row(`<b>Short Google link can't be read here</b><small>In Google Maps, tap the place, then copy the coordinates (long-press the pin) and paste them</small>`);box.hidden=false;return}
     timer=setTimeout(async()=>{
-      try{ ctrl&&ctrl.abort(); ctrl=new AbortController();
-        const c=map.getCenter();
-        const r=await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&lat=${c.lat.toFixed(4)}&lon=${c.lng.toFixed(4)}&limit=7&bbox=76.84,28.40,77.55,28.89`,{signal:ctrl.signal});
-        const j=await r.json(); box.innerHTML="";
-        if(!j.features.length){box.innerHTML='<button disabled><small>No matches in Delhi NCR</small></button>';box.hidden=false;return}
-        for(const f of j.features){ const l=placeLabel(f.properties); const b=document.createElement("button");
-          b.innerHTML=`<b>${esc(l.main)}</b><small>${esc(l.sub)}</small>`;
-          b.onclick=()=>{box.hidden=true;inp.blur();setPoint(which,{lat:f.geometry.coordinates[1],lon:f.geometry.coordinates[0],label:l.main})};
-          box.appendChild(b); }
-        box.hidden=false;
-      }catch(e){ if(e.name!=="AbortError"){box.innerHTML='<button disabled><small>Search unavailable. Tap the map instead.</small></button>';box.hidden=false} }
-    },280);
+      ctrl&&ctrl.abort(); ctrl=new AbortController(); const sig=ctrl.signal;
+      box.innerHTML=""; row(`<small><span class="spin"></span>&nbsp; Searching…</small>`); box.hidden=false;
+      const [g,p,n]=await Promise.allSettled([searchGoogle(q,sig),searchPhoton(q,sig),searchNominatim(q,sig)]);
+      if(sig.aborted) return;
+      box.innerHTML="";
+      const gr=g.status==="fulfilled"?g.value:[], osm=mergeOSM(p.status==="fulfilled"?p.value:[],n.status==="fulfilled"?n.value:[]);
+      for(const x of gr) row(`<b>${esc(x.main)}</b><small>${esc(x.sub)} · Google</small>`,async()=>{
+        try{const ll=await googleDetails(x.placeId);pick({...ll,label:x.main})}catch(e){toast("Google: "+e.message,5000)}});
+      for(const x of osm) row(`<b>${esc(x.main)}</b><small>${esc(x.sub)}</small>`,()=>pick({lat:x.lat,lon:x.lon,label:x.main}));
+      if(g.status==="rejected"&&g.reason&&g.reason.google) row(`<small>Google search error: ${esc(g.reason.message)}</small>`);
+      if(!gr.length&&!osm.length) row(`<b>No matches in Delhi NCR</b><small>Paste coordinates or a plus code from Google Maps, or tap the map</small>`);
+      else if(!gKey()) row(`<small>Missing a shop or office? Paste its coordinates from Google Maps, or turn on Google search below.</small>`);
+    },300);
   });
   inp.addEventListener("keydown",e=>{ if(e.key==="Enter"){const b=box.querySelector("button:not([disabled])");b&&b.click()} if(e.key==="Escape")box.hidden=true });
   inp.addEventListener("blur",()=>setTimeout(()=>box.hidden=true,200));
@@ -639,6 +711,17 @@ document.querySelectorAll(".chip[data-mode]").forEach(b=>b.onclick=()=>{document
 function onTimeChange(){ $("#leave-time").hidden=$("#leave").value!=="at"; drawClosures(); renderClosureList(); if(S.from&&S.to) planRoute(); }
 $("#leave").onchange=onTimeChange; $("#leave-time").onchange=onTimeChange; $("#t-congest").onchange=onTimeChange; $("#t-allday").onchange=onTimeChange;
 
+function gStatus(){ $("#g-open").textContent=`Google search: ${gKey()?"On":"Off"}`; $("#g-key").value=gKey(); }
+$("#g-open").onclick=()=>{const p=$("#g-panel");p.hidden=!p.hidden;$("#g-open").setAttribute("aria-expanded",!p.hidden)};
+$("#g-save").onclick=async()=>{
+  const k=$("#g-key").value.trim(); if(!k){toast("Paste a key first.");return}
+  store.set("dd-gkey",k);
+  try{ await searchGoogle("Connaught Place"); toast("Google search is on."); $("#g-panel").hidden=true; }
+  catch(e){ toast("Key saved, but Google said: "+e.message,7000); }
+  gStatus();
+};
+$("#g-del").onclick=()=>{try{localStorage.removeItem("dd-gkey")}catch(e){} gStatus(); toast("Google search is off.");};
+gStatus();
 function tick(){
   const n=istNow(); $("#clock").textContent=`IST ${hhmm(n.mins)}`;
   const ban=$("#banner");
